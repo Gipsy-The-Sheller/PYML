@@ -127,6 +127,19 @@ class ML_Estimator:
 
         # cache for transition matrices by (id(qmatrix), t)
         self._P_cache = {}
+        # prepare branch parameter indexing: assign an index to each non-root node's branch
+        self.param_index = {}
+        self.params = []
+        # copy topology for indexing
+        topo = copy.deepcopy(self.tree)
+        pid = 0
+        for node in topo.nodes:
+            if not node.is_root():
+                # branch leading to this node
+                self.param_index[id(node)] = pid
+                self.params.append(('branch', pid))
+                pid += 1
+        self.num_params = pid
 
 
         nodes = 2 * self.ntaxa - 1
@@ -212,8 +225,15 @@ class ML_Estimator:
         for i in self.topology.nodes:
             if i.is_root():
                 # compute the likelihood at the root node
-                L_root, log_scales = self.pruning(i.children[0], i.children[1])
-                # L_root: shape (nstates, S)
+                res = self.pruning(i.children[0], i.children[1])
+                # res may be (L_root, log_scales) or (L_root, d1_root, d2_root, log_scales)
+                if len(res) == 2:
+                    L_root, log_scales = res
+                    d1_root = None
+                    d2_root = None
+                else:
+                    L_root, d1_root, d2_root, log_scales = res
+
                 # compute per-site likelihoods by combining with stationary freqs
                 pi = self.qmatrix.freqs
                 if pi is None or len(pi) != self.nstates:
@@ -224,7 +244,30 @@ class ML_Estimator:
                 # protect zeros
                 site_liks = np.where(site_liks <= 0, 1e-300, site_liks)
                 log_sites = np.log(site_liks) + log_scales
-                return np.sum(log_sites)
+                total_loglik = np.sum(log_sites)
+
+                # if derivatives present, compute gradient and Hessian for branch lengths
+                if d1_root is None:
+                    return total_loglik
+
+                P = self.num_params
+                # gradient: g_p = sum_s (1/site_lik_s) * sum_i pi_i * d1_root[p,i,s]
+                grads = np.zeros(P)
+                for p in range(P):
+                    num = (pi[:, None] * d1_root[p]).sum(axis=0)
+                    grads[p] = np.sum(num / site_liks)
+
+                # Hessian: H_{pq} = sum_s [ (sum_i pi_i d2_root[p,q,i,s]) / site_lik_s
+                #                      - (sum_i pi_i d1_root[p,i,s])*(sum_j pi_j d1_root[q,j,s]) / site_lik_s^2 ]
+                H = np.zeros((P, P))
+                for p in range(P):
+                    for q in range(P):
+                        num2 = (pi[:, None] * d2_root[p, q]).sum(axis=0)
+                        num1p = (pi[:, None] * d1_root[p]).sum(axis=0)
+                        num1q = (pi[:, None] * d1_root[q]).sum(axis=0)
+                        H[p, q] = np.sum(num2 / site_liks - (num1p * num1q) / (site_liks ** 2))
+
+                return total_loglik, grads, H
     
     def pruning(self, node1, node2):
         """Vectorized pruning: returns (L_parent, log_scales).
@@ -233,18 +276,26 @@ class ML_Estimator:
         log_scales: ndarray (S,)
         """
         # helper to get leaf or recurse
-        def get_L_and_scales(node):
+        def get_L_d1_d2_scales(node):
             if node.is_leaf():
                 arr = node.metadata['states']  # shape (seq_len * nstates,)
                 seq_len = arr.shape[0] // self.nstates
                 L = arr.reshape((seq_len, self.nstates)).T  # (nstates, S)
                 scales = np.zeros(seq_len)
-                return L, scales
+                # derivatives: d1 shape (P, n, S), d2 shape (P, P, n, S)
+                P = getattr(self, 'num_params', 0)
+                if P > 0:
+                    d1 = np.zeros((P, self.nstates, L.shape[1]))
+                    d2 = np.zeros((P, P, self.nstates, L.shape[1]))
+                else:
+                    d1 = np.zeros((0, self.nstates, L.shape[1]))
+                    d2 = np.zeros((0, 0, self.nstates, L.shape[1]))
+                return L, d1, d2, scales
             else:
                 return self.pruning(node.children[0], node.children[1])
 
-        L1, scales1 = get_L_and_scales(node1)
-        L2, scales2 = get_L_and_scales(node2)
+        L1, d1_1, d2_1, scales1 = get_L_d1_d2_scales(node1)
+        L2, d1_2, d2_2, scales2 = get_L_d1_d2_scales(node2)
 
         # ensure same S
         if L1.shape[1] != L2.shape[1]:
@@ -255,6 +306,11 @@ class ML_Estimator:
         t2 = node2.metadata.get('length', 0.0)
         P1 = self._transition_matrix(t1)
         P2 = self._transition_matrix(t2)
+        # derivatives of P wrt its own branch length (dP/dt, d2P/dt2)
+        dP1 = self._dP_dt(t1)
+        dP2 = self._dP_dt(t2)
+        d2P1 = self._d2P_dt2(t1)
+        d2P2 = self._d2P_dt2(t2)
 
         # propagate: M = P @ L_child  (P: n x n, L_child: n x S) -> n x S
         M1 = P1.dot(L1)
@@ -271,10 +327,83 @@ class ML_Estimator:
         scales[zero_mask] = eps
         L_parent = L_parent / scales
 
+        # now compute first and second derivatives for all parameters
+        Pcount = self.num_params
+        S = L_parent.shape[1]
+        if Pcount == 0:
+            d1_parent = np.zeros((0, self.nstates, S))
+            d2_parent = np.zeros((0, 0, self.nstates, S))
+        else:
+            d1_parent = np.zeros((Pcount, self.nstates, S))
+            d2_parent = np.zeros((Pcount, Pcount, self.nstates, S))
+
+            # which parameter corresponds to node1/node2 branch (if any)
+            idx1 = self.param_index.get(id(node1), None)
+            idx2 = self.param_index.get(id(node2), None)
+
+            # precompute M and children derivatives
+            # For each parameter p, compute dM1/dp and dM2/dp
+            dM1 = np.zeros((Pcount, self.nstates, S))
+            dM2 = np.zeros((Pcount, self.nstates, S))
+            d2M1 = np.zeros((Pcount, Pcount, self.nstates, S))
+            d2M2 = np.zeros((Pcount, Pcount, self.nstates, S))
+
+            # child 1 contributions
+            for p in range(Pcount):
+                # dP/dp is non-zero only if p == idx1
+                term = np.zeros((self.nstates, S))
+                if idx1 is not None and p == idx1:
+                    term = dP1.dot(L1)
+                # add contribution from derivative of L1
+                term += P1.dot(d1_1[p])
+                dM1[p] = term
+            # child 2
+            for p in range(Pcount):
+                term = np.zeros((self.nstates, S))
+                if idx2 is not None and p == idx2:
+                    term = dP2.dot(L2)
+                term += P2.dot(d1_2[p])
+                dM2[p] = term
+
+            # second derivatives
+            for p in range(Pcount):
+                for q in range(Pcount):
+                    term1 = np.zeros((self.nstates, S))
+                    term2 = np.zeros((self.nstates, S))
+                    # for child1
+                    if idx1 is not None:
+                        if p == idx1 and q == idx1:
+                            term1 += d2P1.dot(L1)
+                        elif p == idx1:
+                            term1 += dP1.dot(d1_1[q])
+                        elif q == idx1:
+                            term1 += dP1.dot(d1_1[p])
+                    term1 += P1.dot(d2_1[p, q])
+                    term1 += dP1.dot(d1_1[q]) if (idx1 is not None and q == idx1) else 0
+                    # for child2
+                    if idx2 is not None:
+                        if p == idx2 and q == idx2:
+                            term2 += d2P2.dot(L2)
+                        elif p == idx2:
+                            term2 += dP2.dot(d1_2[q])
+                        elif q == idx2:
+                            term2 += dP2.dot(d1_2[p])
+                    term2 += P2.dot(d2_2[p, q])
+                    term2 += dP2.dot(d1_2[q]) if (idx2 is not None and q == idx2) else 0
+
+                    d2M1[p, q] = term1
+                    d2M2[p, q] = term2
+
+            # now form d1_parent and d2_parent using product rule
+            for p in range(Pcount):
+                d1_parent[p] = dM1[p] * M2 + M1 * dM2[p]
+                for q in range(Pcount):
+                    d2_parent[p, q] = d2M1[p, q] * M2 + dM1[p] * dM2[q] + dM1[q] * dM2[p] + M1 * d2M2[p, q]
+
         # accumulate log scales from children and this node
         log_scales = np.log(scales) + scales1 + scales2
 
-        return L_parent, log_scales
+        return L_parent, d1_parent, d2_parent, log_scales
 
     def _transition_matrix(self, t):
         # Return transition probability matrix P = exp(Q * t)
@@ -341,3 +470,43 @@ class ML_Estimator:
 
         self._P_cache[key] = P
         return P
+
+    def _rate_matrix(self):
+        # build Q (generator) from qmatrix Rmatrix and freqs
+        R = getattr(self.qmatrix, 'Rmatrix', None)
+        freqs = getattr(self.qmatrix, 'freqs', None)
+        if R is None or freqs is None:
+            raise RuntimeError('QMatrix must have Rmatrix and freqs to build rate matrix')
+        n = self.nstates
+        pi = np.asarray(freqs, dtype=float)
+        Q = np.zeros((n, n), dtype=float)
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    Q[i, j] = R[i, j] * pi[j]
+        for i in range(n):
+            Q[i, i] = -np.sum(Q[i, :]) + Q[i, i]
+        return Q
+
+    def _dP_dt(self, t):
+        # dP/dt = Q P
+        key = ('d', id(self.qmatrix), float(t))
+        if key in self._P_cache:
+            return self._P_cache[key]
+        P = self._transition_matrix(t)
+        Q = self._rate_matrix()
+        dP = Q.dot(P)
+        self._P_cache[key] = dP
+        return dP
+
+    def _d2P_dt2(self, t):
+        # d2P/dt2 = Q^2 P
+        key = ('d2', id(self.qmatrix), float(t))
+        if key in self._P_cache:
+            return self._P_cache[key]
+        Q = self._rate_matrix()
+        P = self._transition_matrix(t)
+        Q2 = Q.dot(Q)
+        d2P = Q2.dot(P)
+        self._P_cache[key] = d2P
+        return d2P
