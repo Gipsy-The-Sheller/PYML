@@ -9,23 +9,21 @@ import numpy as np
 import Bio
 import copy
 
-JC, K2P, HKY, GTR = [QMatrix(4) for _ in range(4)]
-JC.set_attributes(['A', 'C', 'G', 'T'])
-JC.Rmatrix = np.array([[-1, 0.25, 0.25, 0.25],
-                       [0.25, -1, 0.25, 0.25],
-                       [0.25, 0.25, -1, 0.25],
-                       [0.25, 0.25, 0.25, -1]])
-JC.freqs = np.array([0.25, 0.25, 0.25, 0.25])
-
 
 # core data structure
 
 class PhyloData:
-    def __init__(self, seqs: Bio.SeqRecord, nstates=None, tree=None, qmatrix=JC):
+    def __init__(self, seqs: Bio.SeqRecord, nstates=None, tree=None, qmatrix=None):
         self.seqs = seqs
         self.nstates = nstates
         self.tree = tree
         self.qmatrix = qmatrix
+        if self.qmatrix is None:
+            # use module default JC if not provided (created later)
+            try:
+                self.qmatrix = JC
+            except NameError:
+                self.qmatrix = None
 
         if self.nstates is None:
             self.nstates = len(set(str(seqs[0].seq)))  # infer nstates from the first sequence
@@ -87,6 +85,16 @@ class QMatrix:
         # or empirical models (like JTT and WAG) with a fixed RMatrix.
         # && rate constraints for universal models (use Rshape).
 
+
+# create simple default matrices after QMatrix is defined
+JC, K2P, HKY, GTR = [QMatrix(4) for _ in range(4)]
+JC.set_attributes(['A', 'C', 'G', 'T'])
+JC.Rmatrix = np.array([[-1, 0.25, 0.25, 0.25],
+                       [0.25, -1, 0.25, 0.25],
+                       [0.25, 0.25, -1, 0.25],
+                       [0.25, 0.25, 0.25, -1]])
+JC.freqs = np.array([0.25, 0.25, 0.25, 0.25])
+
 # binary tree topology structure
 
 class Topology:
@@ -116,6 +124,9 @@ class ML_Estimator:
         self.tree = phylo_data.tree
         self.nstates = phylo_data.nstates
         self.ntaxa = len(phylo_data.seqs)
+
+        # cache for transition matrices by (id(qmatrix), t)
+        self._P_cache = {}
 
 
         nodes = 2 * self.ntaxa - 1
@@ -201,24 +212,132 @@ class ML_Estimator:
         for i in self.topology.nodes:
             if i.is_root():
                 # compute the likelihood at the root node
-                logliks = self.prunning(i.children[0], i.children[1])
-                
-                # total likelihood is the sum of logliks
-                # total_loglik = np.log(np.sum(np.exp(logliks))) NOTE: this is not a true implementation as each site occupies nstate entries to store one-hot encoding.
-                total_loglik = 0 # TODO: implement loglik calculation
+                L_root, log_scales = self.pruning(i.children[0], i.children[1])
+                # L_root: shape (nstates, S)
+                # compute per-site likelihoods by combining with stationary freqs
+                pi = self.qmatrix.freqs
+                if pi is None or len(pi) != self.nstates:
+                    # fallback to uniform
+                    pi = np.full(self.nstates, 1.0 / self.nstates)
 
-                return total_loglik
+                site_liks = (pi[:, None] * L_root).sum(axis=0)
+                # protect zeros
+                site_liks = np.where(site_liks <= 0, 1e-300, site_liks)
+                log_sites = np.log(site_liks) + log_scales
+                return np.sum(log_sites)
     
-    def prunning(self, node1, node2):
-        if node1.is_leaf():
-            node1_logliks = node1.metadata['states']
-        else:
-            node1_logliks = self.prunning(node1.children[0], node1.children[1])
-        if node2.is_leaf():
-            node2_logliks = node2.metadata['states']
-        else:
-            node2_logliks = self.prunning(node2.children[0], node2.children[1])
-        logliks = np.zeros(self.nstates)
-        # TODO
+    def pruning(self, node1, node2):
+        """Vectorized pruning: returns (L_parent, log_scales).
 
-        return logliks
+        L_parent: ndarray (nstates, S)
+        log_scales: ndarray (S,)
+        """
+        # helper to get leaf or recurse
+        def get_L_and_scales(node):
+            if node.is_leaf():
+                arr = node.metadata['states']  # shape (seq_len * nstates,)
+                seq_len = arr.shape[0] // self.nstates
+                L = arr.reshape((seq_len, self.nstates)).T  # (nstates, S)
+                scales = np.zeros(seq_len)
+                return L, scales
+            else:
+                return self.pruning(node.children[0], node.children[1])
+
+        L1, scales1 = get_L_and_scales(node1)
+        L2, scales2 = get_L_and_scales(node2)
+
+        # ensure same S
+        if L1.shape[1] != L2.shape[1]:
+            raise ValueError('Site count mismatch between child likelihoods')
+
+        # get transition matrices for branches from parent to node1/node2
+        t1 = node1.metadata.get('length', 0.0)
+        t2 = node2.metadata.get('length', 0.0)
+        P1 = self._transition_matrix(t1)
+        P2 = self._transition_matrix(t2)
+
+        # propagate: M = P @ L_child  (P: n x n, L_child: n x S) -> n x S
+        M1 = P1.dot(L1)
+        M2 = P2.dot(L2)
+
+        # elementwise product across children
+        L_parent = M1 * M2
+
+        # scaling per site to avoid underflow
+        scales = L_parent.sum(axis=0)
+        # avoid zeros
+        eps = 1e-300
+        zero_mask = scales <= 0
+        scales[zero_mask] = eps
+        L_parent = L_parent / scales
+
+        # accumulate log scales from children and this node
+        log_scales = np.log(scales) + scales1 + scales2
+
+        return L_parent, log_scales
+
+    def _transition_matrix(self, t):
+        # Return transition probability matrix P = exp(Q * t)
+        n = self.nstates
+
+        # cache key
+        qid = id(self.qmatrix) if self.qmatrix is not None else 0
+        key = (qid, float(t))
+        if key in self._P_cache:
+            return self._P_cache[key]
+
+        # If JC-like simple case (4 states, uniform freqs, symmetric R), use analytic formula
+        freqs = getattr(self.qmatrix, 'freqs', None)
+        R = getattr(self.qmatrix, 'Rmatrix', None)
+        use_jc = False
+        if n == 4 and freqs is not None and np.allclose(freqs, np.full(4, 0.25)):
+            # detect JC by Rmatrix having equal off-diagonals
+            if R is not None:
+                off = R[~np.eye(4, dtype=bool)]
+                if np.allclose(off, off.flat[0]):
+                    use_jc = True
+
+        if use_jc:
+            expf = np.exp(-4.0 / 3.0 * t)
+            p_same = 0.25 + 0.75 * expf
+            p_diff = 0.25 - 0.25 * expf
+            P = np.full((4, 4), p_diff)
+            np.fill_diagonal(P, p_same)
+            self._P_cache[key] = P
+            return P
+
+        # General case: build rate matrix Q from Rmatrix and freqs (GTR-style)
+        if R is None or freqs is None:
+            raise NotImplementedError('General transition matrix requires Rmatrix and freqs')
+
+        pi = np.asarray(freqs, dtype=float)
+        # q_ij = r_ij * pi_j for i != j
+        Q = np.zeros((n, n), dtype=float)
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    Q[i, j] = R[i, j] * pi[j]
+        # diagonal
+        for i in range(n):
+            Q[i, i] = -np.sum(Q[i, :]) + Q[i, i]
+
+        # matrix exponential via eigendecomposition (may produce small complex parts)
+        vals, vecs = np.linalg.eig(Q)
+        try:
+            inv_vecs = np.linalg.inv(vecs)
+        except np.linalg.LinAlgError:
+            # fallback: use series approximation (very small t) or raise
+            raise RuntimeError('Eigen-decomposition of Q failed; cannot compute expm')
+
+        exp_diag = np.exp(vals * t)
+        P = vecs.dot(np.diag(exp_diag)).dot(inv_vecs)
+        P = np.real(P)
+
+        # numerical fixes: clip tiny negatives, renormalize rows
+        P[P < 0] = 0.0
+        row_sums = P.sum(axis=1)
+        row_sums[row_sums == 0] = 1.0
+        P = P / row_sums[:, None]
+
+        self._P_cache[key] = P
+        return P
