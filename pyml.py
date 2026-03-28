@@ -4,6 +4,8 @@
 # and more flexible model supports, not only BaseML and CodeML.
 # Also I want to know if Fortran and Numpy parallelization can catch up with (part of) PLL / BEAGLE, and faster than PAML's single-thread ML calculator.
 
+# NOTE: Likelihood estimation: same as IQ-Tree.
+
 
 import numpy as np
 import Bio
@@ -13,7 +15,7 @@ import copy
 # core data structure
 
 class PhyloData:
-    def __init__(self, seqs: Bio.SeqRecord, nstates=None, tree=None, qmatrix=None):
+    def __init__(self, seqs, nstates=None, tree=None, qmatrix=None):
         self.seqs = seqs
         self.nstates = nstates
         self.tree = tree
@@ -86,14 +88,15 @@ class QMatrix:
         # && rate constraints for universal models (use Rshape).
 
 
-# create simple default matrices after QMatrix is defined
-JC, K2P, HKY, GTR = [QMatrix(4) for _ in range(4)]
-JC.set_attributes(['A', 'C', 'G', 'T'])
-JC.Rmatrix = np.array([[-1, 0.25, 0.25, 0.25],
-                       [0.25, -1, 0.25, 0.25],
-                       [0.25, 0.25, -1, 0.25],
-                       [0.25, 0.25, 0.25, -1]])
-JC.freqs = np.array([0.25, 0.25, 0.25, 0.25])
+# initialize common models via dedicated modules
+from dna_models import jc69, k2p, hky, gtr  # factories accept QMatrix class
+from aa_models import uniform_aa, graft_empirical
+
+# create default DNA models
+JC = jc69(QMatrix)
+K2P = k2p(QMatrix)
+HKY = hky(QMatrix)
+GTR = gtr(QMatrix)
 
 # binary tree topology structure
 
@@ -106,16 +109,66 @@ class Topology:
         self.nodes = [Node() for _ in range(2 * ntaxa - 1)]
 
 class Node:
-    def __init__(self, parents=None, children=None, **metadata):
-        self.parents = parents
-        self.children = children
-        self.metadata = metadata
+    _uid_counter = 0
+
+    def __init__(self, name=None, parent=None, children=None, brlength=None, **metadata):
+        # stable unique id for indexing (copied by deepcopy)
+        Node._uid_counter += 1
+        self.uid = Node._uid_counter
+
+        self.name = name
+        # single parent model (None for root)
+        self.parent = parent
+        # children is always a list
+        self.children = [] if children is None else list(children)
+
+        # branch length to this node (from parent)
+        self.brlength = brlength
+
+        # metadata dict kept for backward compatibility
+        self.metadata = dict(metadata)
+        if name is not None:
+            self.metadata.setdefault('name', name)
+        if brlength is not None:
+            # keep legacy metadata['length'] in sync
+            self.metadata['length'] = brlength
+
+        # if parent provided, register this node as a child
+        if parent is not None:
+            try:
+                parent.add_child(self)
+            except Exception:
+                # best-effort: if parent has no add_child, append
+                if hasattr(parent, 'children'):
+                    parent.children.append(self)
+
+    def add_child(self, child):
+        if child not in self.children:
+            self.children.append(child)
+        child.parent = self
+
+    def add_parent(self, parent):
+        self.parent = parent
+        if self not in parent.children:
+            parent.children.append(self)
 
     def is_leaf(self):
-        return self.children is None or len(self.children) == 0
-    
+        return len(self.children) == 0
+
     def is_root(self):
-        return self.parents is None or len(self.parents) == 0
+        return self.parent is None
+
+    @property
+    def length(self):
+        # preferred accessor for branch length (to this node)
+        if self.brlength is not None:
+            return self.brlength
+        return float(self.metadata.get('length', 0.0))
+
+    @length.setter
+    def length(self, value):
+        self.brlength = value
+        self.metadata['length'] = value
 
 class ML_Estimator:
     def __init__(self, phylo_data):
@@ -135,8 +188,8 @@ class ML_Estimator:
         pid = 0
         for node in topo.nodes:
             if not node.is_root():
-                # branch leading to this node
-                self.param_index[id(node)] = pid
+                # branch leading to this node: use stable uid instead of id()
+                self.param_index[node.uid] = pid
                 self.params.append(('branch', pid))
                 pid += 1
         self.num_params = pid
@@ -302,8 +355,9 @@ class ML_Estimator:
             raise ValueError('Site count mismatch between child likelihoods')
 
         # get transition matrices for branches from parent to node1/node2
-        t1 = node1.metadata.get('length', 0.0)
-        t2 = node2.metadata.get('length', 0.0)
+        # branch lengths: prefer new `length` property
+        t1 = getattr(node1, 'length', node1.metadata.get('length', 0.0))
+        t2 = getattr(node2, 'length', node2.metadata.get('length', 0.0))
         P1 = self._transition_matrix(t1)
         P2 = self._transition_matrix(t2)
         # derivatives of P wrt its own branch length (dP/dt, d2P/dt2)
@@ -338,8 +392,8 @@ class ML_Estimator:
             d2_parent = np.zeros((Pcount, Pcount, self.nstates, S))
 
             # which parameter corresponds to node1/node2 branch (if any)
-            idx1 = self.param_index.get(id(node1), None)
-            idx2 = self.param_index.get(id(node2), None)
+            idx1 = self.param_index.get(node1.uid, None)
+            idx2 = self.param_index.get(node2.uid, None)
 
             # precompute M and children derivatives
             # For each parameter p, compute dM1/dp and dM2/dp
