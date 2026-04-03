@@ -40,8 +40,40 @@ class likelihoodCalculator:
     
     def default_model(self, t):
         # DEFAULT: directly use the phyloData's Qmatrix to generate a concatenated array of nsites * Pmatrix
-        Pmatrix = self.phyloData.Pmatrix(t)
+        Pmatrix = self.phyloData.qmatrix.Pmatrix(t)
         return np.tile(Pmatrix, (self.data_length, 1))
+
+    def set_branch_lengths_from_params(self, params: dict):
+        # map parameters named 'brlens_{i}' to non-root nodes in the same order as tree.nodes
+        nonroot_nodes = [n for n in self.phyloData.tree.nodes if not n.is_root]
+        for i, node in enumerate(nonroot_nodes):
+            key = f'brlens_{i}'
+            if key in params:
+                node.branch_length = params[key]
+
+    def reset_internal_calculated_flags(self):
+        for node in self.phyloData.tree.nodes:
+            if not node.is_leaf:
+                node.metadata['calculated'] = False
+
+    def log_likelihood(self, params: dict):
+        # apply branch lengths / topology from params then compute log likelihood
+        # update branch lengths
+        self.set_branch_lengths_from_params(params)
+
+        # reset calculation flags for internal nodes
+        self.reset_internal_calculated_flags()
+
+        # find root
+        root = None
+        for n in self.phyloData.tree.nodes:
+            if n.is_root:
+                root = n
+                break
+        if root is None:
+            raise ValueError('No root found in tree')
+
+        return self.prune(root)
 
     def init_nodes(self):
         for i, node in enumerate(self.phyloData.tree.nodes):

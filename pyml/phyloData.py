@@ -11,14 +11,18 @@ else:
     from scipy.linalg import expm
 
 class Node:
-    def __init__(self, parent, children:None, label:str=None, branch_length:float=None, **metadata):
+    def __init__(self, parent=None, children=None, branch_length:float=None, name:str=None, **metadata):
         self.parent = None
-        parent.add_child(self) if parent else None
+        if parent:
+            parent.add_child(self)
 
         self.children = children
-        self.label = label
         self.branch_length = branch_length
-        self.metadata = metadata
+        # compatibility alias used elsewhere
+        self.brlength = branch_length
+        self.metadata = metadata or {}
+        if name:
+            self.metadata['name'] = name
     
     def add_child(self, child_node):
         if self.children is None:
