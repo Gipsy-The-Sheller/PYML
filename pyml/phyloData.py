@@ -2,6 +2,7 @@ from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 from Bio.Align import MultipleSeqAlignment
 import pandas as pd
+import numpy as np
 
 RELEASE = False
 if RELEASE:
@@ -125,14 +126,23 @@ class SubstMatrix:
     @property
     def Qmatrix(self):
         if self.type == self.SET1_TYPE:
-            # Compute Qmatrix from Rmatrix and freqs: rates * freqs
-            # self.Qmatrix = self.Rmatrix * self.freqs
-            pass
+            # Compute Qmatrix from Rmatrix and freqs: Q[i,j] = R[i,j] * pi[j] for i != j
+            R = np.asarray(self.Rmatrix, dtype=float)
+            pi = np.asarray(self.freqs, dtype=float)
+            n = self.nstates
+            Q = np.zeros((n, n), dtype=float)
+            for i in range(n):
+                for j in range(n):
+                    if i != j:
+                        Q[i, j] = R[i, j] * pi[j]
+            for i in range(n):
+                Q[i, i] = -np.sum(Q[i, :])
+            return Q
         elif self.type == self.SET2_TYPE:
-            return self.Q
+            return np.asarray(self.Q, dtype=float)
         elif self.type == self.SET3_TYPE:
             # construct Rmatrix from Rconsts and parameters, then compute Qmatrix
-            pass #TODO: implement
+            raise NotImplementedError("SET3_TYPE not yet implemented")
 
     def Pmatrix(self, t):
         # compute transition probability matrix P(t) = exp(Qt)

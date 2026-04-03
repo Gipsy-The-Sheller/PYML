@@ -45,11 +45,11 @@ class likelihoodCalculator:
 
     def init_nodes(self):
         for i, node in enumerate(self.phyloData.tree.nodes):
-            node.metadata['lik_index'] = i  # index in the likelihood array
+            node.metadata['lik_index'] = i  # index in the likelihood array (for debugging)
+            node.metadata['calculated'] = False  # track if likelihood has been computed
+            
             if node.is_leaf:
                 # initialize likelihood vector for leaf nodes based on observed traits
-
-                # locate the row for this leaf
                 seq_id = node.metadata['name']
                 row = self.phyloData.alignment.loc[seq_id]
 
@@ -61,79 +61,83 @@ class likelihoodCalculator:
                         solution = self.exceptions(site) if self.exceptions else [1/self.nstates] * self.nstates
                         for j in range(self.nstates):
                             self.lik_array[i, index*self.nstates + j] = solution[j]
-
-
-                # ABANDONED!
-                # for site in range(self.data_length):
-                #     # find the row in alignment for this leaf (with id corresponding to the node)
-                #     trait = self.phyloData.alignment.loc[node.metadata['name'], site]
-                #     if trait in self.phyloData.states:
-                #         state_index = self.phyloData.qmatrix.state_to_index[trait]
-                #         node.metadata['lik_index'] = [1 if j == state_index else 0 for j in range(self.nstates)]
-                #     else:
-                #         solution = self.exceptions(trait)
-                #         node.metadata['lik_index'] = [solution[index] for index, state in enumerate(self.phyloData.states)]
+                
+                # Store the likelihood vector reference and mark as calculated
+                node.metadata['lik_vector'] = self.lik_array[i].reshape(self.data_length, self.nstates).T
+                node.metadata['calculated'] = True
+    
+    def get_pmatrix(self, t):
+        """Get transition probability matrix for branch length t."""
+        if self.model is not None:
+            return self.model(t)
+        elif self.phyloData.qmatrix is not None:
+            return self.phyloData.qmatrix.Pmatrix(t)
+        else:
+            raise ValueError("No model or qmatrix available for computing transition matrix")
     
     def prune(self, node):
         """
-        implement Felsenstein's pruning algorithm to compute likelihoods at internal nodes.
+        Implement Felsenstein's pruning algorithm to compute likelihoods at internal nodes.
+        Uses post-order traversal with explicit stack.
         """
-        
-        # ABANDONED!
-        # we preserve a vector cache to store all quotes to likelihood vectors to facilitate vectorized computation
-        # likvec_left = np.array([])
-        # likvec_right = np.array([])
-        # p_left = np.array([])
-        # p_right = np.array([])
-
-        # Then traverse the subtree to add tasks for the cache
         stack_depth = 0
         while True:
-            if np.any(node.metadata['lik_index']):
-                # already calculated. break.
+            # Check if this node's likelihood has been calculated
+            if node.metadata.get('calculated', False):
                 break
+            
             left, right = node.children[0], node.children[1]
 
-            # if left and right nodes already have non-zero likelihood vectors, then we can prune this node
-            if np.any(left.metadata['lik_index']) and np.any(right.metadata['lik_index']):
-                # # compute transition probability matrices for left and right branches
-                # p_left = self.phyloData.Pmatrix(left.metadata['length'])
-                # p_right = self.phyloData.Pmatrix(right.metadata['length'])
+            # If both children have calculated likelihoods, compute this node
+            if left.metadata.get('calculated', False) and right.metadata.get('calculated', False):
+                # Get branch lengths
+                t_left = left.branch_length if left.branch_length is not None else left.metadata.get('length', 0.0)
+                t_right = right.branch_length if right.branch_length is not None else right.metadata.get('length', 0.0)
+                
+                # Get transition probability matrices
+                P_left = self.get_pmatrix(t_left)
+                P_right = self.get_pmatrix(t_right)
 
-                # # compute likelihood vector for this node by multiplying transition probabilities with child likelihood vectors
-                # likvec_left = np.dot(p_left, left.metadata['lik_index'])
-                # likvec_right = np.dot(p_right, right.metadata['lik_index'])
-                # node.metadata['lik_index'] = likvec_left * likvec_right  # element-wise multiplication
+                # Get child likelihood vectors (shape: nstates x nsites)
+                L_left = left.metadata['lik_vector']
+                L_right = right.metadata['lik_vector']
 
-                # generate pmatrix array with self.model
-                p_left = self.model(left.metadata['length'])
-                p_right = self.model(right.metadata['length'])
+                # Compute likelihood vector for this node
+                # L_parent[i] = sum_j P_ij * L_child[j] for each site
+                likvec_left = np.dot(P_left, L_left)
+                likvec_right = np.dot(P_right, L_right)
+                L_parent = likvec_left * likvec_right  # element-wise multiplication
 
-                # compute likelihood vector for this node by multiplying transition probabilities with child likelihood vectors
-                likvec_left = np.dot(p_left, left.metadata['lik_index'])
-                likvec_right = np.dot(p_right, right.metadata['lik_index'])
-                node.metadata['lik_index'] = likvec_left * likvec_right  # element-wise multiplication
+                # Store result
+                node.metadata['lik_vector'] = L_parent
+                node.metadata['calculated'] = True
 
-                # move up to parent node
-                if stack_depth > 0:
+                # Move up to parent node if exists, otherwise we're done
+                if node.parent is not None:
                     node = node.parent
+                    stack_depth = max(0, stack_depth - 1)
                     continue
                 else:
                     break
             
-            # if the likelihood vector for left node is already computed (but not for right node), then we can move down to right node
-
-            elif np.any(left.metadata['lik_index']):
+            # Traverse down to uncalculated children
+            elif left.metadata.get('calculated', False):
                 node = right
                 stack_depth += 1
-            
             else:
                 node = left
                 stack_depth += 1
 
-        # the root likelihood vector should be generated with frequencies
-        # if we cannot obtain freqs, then use equal freqs
+        # At root: combine with stationary frequencies
         freqs = self.phyloData.qmatrix.freqs if self.phyloData.qmatrix and self.phyloData.qmatrix.freqs is not None else np.array([1/self.nstates] * self.nstates)
-        root_lik_vec = node.metadata['lik_index'] * freqs
-        log_likelihood = np.sum(np.log(root_lik_vec))
+        
+        root_lik_vec = node.metadata['lik_vector']  # shape: nstates x nsites
+        
+        # Per-site likelihood: sum_i pi_i * L_i for each site
+        site_liks = np.dot(freqs, root_lik_vec)  # shape: (nsites,)
+        
+        # Handle potential numerical issues
+        site_liks = np.where(site_liks <= 0, 1e-300, site_liks)
+        
+        log_likelihood = np.sum(np.log(site_liks))
         return log_likelihood
