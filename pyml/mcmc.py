@@ -72,6 +72,16 @@ class MetropolisHastings:
         self.current_logprior = logprior
         self.posterior = self.posterior_func(loglik, logprior)
         self.current_posterior = self.posterior
+    
+    def update_posterior(self):
+        # compute posterior for proposed state
+        loglik = self.likelihoodCalculator.log_likelihood(self.parameters)
+        logprior = sum(p.log_prior(self.parameters) for p in self.priors)
+        logpost = self.posterior_func(loglik, logprior)
+
+        self.current_loglik = loglik
+        self.current_logprior = logprior
+        self.current_posterior = logpost
 
     def run(self):
         # single MCMC iteration: propose and accept/reject
@@ -86,21 +96,16 @@ class MetropolisHastings:
         # apply proposal (operator modifies self.parameters and/or phyloData in-place)
         operator.propose_func(self.parameters, op_param)
 
-        # compute posterior for proposed state
-        loglik = self.likelihoodCalculator.log_likelihood(self.parameters)
-        logprior = sum(p.log_prior(self.parameters) for p in self.priors)
-        logpost = self.posterior_func(loglik, logprior)
+        self.update_posterior()
 
         # store current proposed values for external access
-        self.current_loglik = loglik
-        self.current_logprior = logprior
-        self.current_posterior = logpost
 
-        log_accept_ratio = logpost - self.posterior
+
+        log_accept_ratio = self.current_posterior - self.posterior
 
         if np.log(np.random.rand()) < log_accept_ratio:
             # accept
-            self.posterior = logpost
+            self.posterior = self.current_posterior
         else:
             # reject: restore snapshots
             self.parameters.clear()
@@ -184,3 +189,76 @@ class MetropolisHastings:
         tree = self.likelihoodCalculator.phyloData.tree
         brlens = [getattr(n, 'brlength', None) or getattr(n, 'branch_length', None) for n in tree.nodes if not n.is_root]
         return brlens
+
+class MCMCMC: 
+    def posterior_func(self, loglik, logprior, temperature):
+        return loglik / temperature + logprior
+
+    def __init__(self, 
+                 likelihoodCalculator, 
+                 parameters:dict, 
+                 operators:list, 
+                 priors:list,
+                 trace:list = None,
+                 chain_temperatures:list = [1.0],):
+        # check temperatures (must at least 1 is 1.0 for the cold chain)
+        if 1.0 not in chain_temperatures:
+            raise ValueError("Chain temperatures must include 1.0 for the cold chain")
+        self.chain_temperatures = chain_temperatures
+        self.chains = [MetropolisHastings(
+            likelihoodCalculator, 
+            copy.deepcopy(parameters), 
+            operators, 
+            priors, 
+            trace, 
+            lambda x, y: self.posterior_func(x, y, temp)) 
+            for temp in chain_temperatures]
+    
+    def run(self):
+
+        for chain in self.chains:
+            chain.run()
+        
+        to_swap = random.sample(range(len(self.chains)), 2)
+        energies = [-chain.current_posterior for chain in self.chains]
+        temperatures = self.chain_temperatures
+
+        swap_accept_prob = min(1, np.exp((energies[to_swap[0]] - energies[to_swap[1]]) * (1/temperatures[to_swap[0]] - 1/temperatures[to_swap[1]])))
+
+        if np.random.rand() < swap_accept_prob:
+            # swap states between the two chains
+            self.chains[to_swap[0]].parameters, self.chains[to_swap[1]].parameters = self.chains[to_swap[1]].parameters, self.chains[to_swap[0]].parameters
+            self.chains[to_swap[0]].likelihoodCalculator.phyloData, self.chains[to_swap[1]].likelihoodCalculator.phyloData = self.chains[to_swap[1]].likelihoodCalculator.phyloData, self.chains[to_swap[0]].likelihoodCalculator.phyloData
+            # after swapping, update posteriors for both chains
+            self.chain_temperatures[to_swap[0]], self.chain_temperatures[to_swap[1]] = self.chain_temperatures[to_swap[1]], self.chain_temperatures[to_swap[0]]
+            self.chains[to_swap[0]].posterior_func = lambda x, y: self.posterior_func(x, y, self.chain_temperatures[to_swap[0]])
+            self.chains[to_swap[1]].posterior_func = lambda x, y: self.posterior_func(x, y, self.chain_temperatures[to_swap[1]])
+            self.chains[to_swap[0]].update_posterior()
+            self.chains[to_swap[1]].update_posterior()
+
+    def print_states(self):
+        print(self.states_log())
+
+    def states_log(self):
+        """
+        single-line log resembling MrBayes output
+        """
+        posteriors = [chain.current_posterior for chain in self.chains]
+        log = ''
+        for i in range(len(self.chains)):
+            if self.chain_temperatures[i] == 1.0:
+                log = f"{log}[{posteriors[i]:.2f}]\t"  # highlight cold chain
+            else:
+                log = f"{log}({posteriors[i]:.2f})\t"
+        
+        return log
+    
+    def savetracelist(self):
+        """Return the trace list from the cold chain"""
+        cold_chain_index = self.chain_temperatures.index(1.0)
+        return self.chains[cold_chain_index].savetracelist()
+    
+    def savetreelist(self):
+        """Return the tree list from the cold chain"""
+        cold_chain_index = self.chain_temperatures.index(1.0)
+        return self.chains[cold_chain_index].savetreelist()
