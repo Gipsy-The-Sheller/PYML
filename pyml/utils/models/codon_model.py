@@ -1,4 +1,5 @@
 from ...import SubstMatrix
+import numpy as np
 RELEASE = False
 if RELEASE:
     from ...maths.expm import expm_core as expm
@@ -142,7 +143,7 @@ class GY94(CodonModel):
         for i in range(super().nstates):
             R[i][i] = -sum(R[i][j] for j in range(super().nstates) if j != i)
         
-        return R
+        return np.array(R)
 
     @property
     def Qmatrix(self):
@@ -155,16 +156,16 @@ class GY94(CodonModel):
         for i in range(super().nstates):
             Q[i][i] = -sum(Q[i][j] for j in range(super().nstates) if j != i)
         
-        return Q
+        return np.array(Q)
     
     def Pmatrix(self, t):
         # compute transition probability matrix P(t) = exp(Qt)
-        return expm(self.Qmatrix * t)
+        return expm(np.array(self.Qmatrix) * t)
     
-class MG94(GY94):
-    def __init__(self, codon_table=standard, omega=1.0):
-        """
-        MG94 model: do not consider transition/transversion bias (kappa=1.0).
-        """
-        # fix kappa = 1.0 so that GY94 reduces to MG94
-        super().__init__(codon_table, 1, omega)
+# class MG94(GY94):
+#     def __init__(self, codon_table=standard, omega=1.0):
+#         """
+#         MG94 model: do not consider transition/transversion bias (kappa=1.0).
+#         """
+#         # fix kappa = 1.0 so that GY94 reduces to MG94
+#         super().__init__(codon_table, 1, omega)
