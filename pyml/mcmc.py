@@ -233,8 +233,12 @@ class MCMCMC:
 
         if np.random.rand() < swap_accept_prob:
             # swap states between the two chains
-            self.chains[to_swap[0]].parameters, self.chains[to_swap[1]].parameters = self.chains[to_swap[1]].parameters, self.chains[to_swap[0]].parameters
-            self.chains[to_swap[0]].likelihoodCalculator.phyloData, self.chains[to_swap[1]].likelihoodCalculator.phyloData = self.chains[to_swap[1]].likelihoodCalculator.phyloData, self.chains[to_swap[0]].likelihoodCalculator.phyloData
+            # NOTE: owing to that we want to visualize the swap of 2 chains (like MrBayes), we do not swap current states, but temperature
+            # Therefore, the codes below should not be used:
+            # self.chains[to_swap[0]].parameters, self.chains[to_swap[1]].parameters = self.chains[to_swap[1]].parameters, self.chains[to_swap[0]].parameters
+            # self.chains[to_swap[0]].likelihoodCalculator.phyloData, self.chains[to_swap[1]].likelihoodCalculator.phyloData = self.chains[to_swap[1]].likelihoodCalculator.phyloData, self.chains[to_swap[0]].likelihoodCalculator.phyloData
+            
+            
             # after swapping, update posteriors for both chains
             self.chain_temperatures[to_swap[0]], self.chain_temperatures[to_swap[1]] = self.chain_temperatures[to_swap[1]], self.chain_temperatures[to_swap[0]]
             self.chains[to_swap[0]].posterior_func = lambda x, y: self.posterior_func(x, y, self.chain_temperatures[to_swap[0]])
@@ -333,3 +337,7 @@ class SS(MCMCMC):
             print(f"Warning: smallest beta={betas[0]:.4g} > 0; estimate is logZ(1)-logZ({betas[0]:.4g}). Consider including beta=0 for full marginal likelihood.")
 
         return total
+    
+    @property
+    def temperature_gradients(self):
+        return sorted(self.chain_temperatures)
