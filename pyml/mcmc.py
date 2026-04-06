@@ -1,6 +1,12 @@
 import numpy as np
 import copy
 import random
+from dataclasses import dataclass
+
+@dataclass
+class MCMCParam:
+    name: str
+    value: any
 
 def defaultPosterior(loglik, logprior):
     return loglik + logprior
@@ -262,3 +268,68 @@ class MCMCMC:
         """Return the tree list from the cold chain"""
         cold_chain_index = self.chain_temperatures.index(1.0)
         return self.chains[cold_chain_index].savetreelist()
+
+class SS(MCMCMC):
+    """
+    Stepping-stone sampler to estimate marginal likelihood
+    """
+    def __init__(self, 
+                 likelihoodCalculator, 
+                 parameters:dict, 
+                 operators:list, 
+                 priors:list,
+                 trace:list = None,
+                 temp_grids = 10):
+        
+        """
+        temp_grids: number od divisions between 0 and 1 for beta (beta = 1 / T)
+        """
+        self.chain_temperatures = [i / temp_grids for i in range(temp_grids+1)]
+        super().__init__(likelihoodCalculator, parameters, operators, priors, trace, self.chain_temperatures)
+        self.logliks = [[] for _ in self.chain_temperatures]  # to store posterior samples for each chain
+
+    def sample_ss(self):
+        # obtain log-likelihood samples from each chain (required for stepping-stone)
+        for index, chain in enumerate(self.chains):
+            self.logliks[index].append(chain.current_loglik)
+
+    def estimate_marginal_likelihood(self):
+        """
+        Estimate log marginal likelihood via the stepping-stone method.
+
+        Returns an estimate of log Z = log Z(1) - log Z(beta_min), where beta=1/T.
+        Requires that `self.logliks[k]` contains an array/list of log-likelihood
+        samples collected from the chain at temperature `self.chain_temperatures[k]`.
+        """
+        # collect (beta, samples) pairs and filter empty sample sets
+        pairs = []
+        for i, T in enumerate(self.chain_temperatures):
+            beta = 1.0 / T
+            arr = np.asarray(self.logliks[i], dtype=float)
+            if arr.size > 0:
+                pairs.append((beta, arr))
+
+        if len(pairs) < 2:
+            raise ValueError("Need samples from at least two temperatures to estimate marginal likelihood")
+
+        # sort by beta ascending (from 0 -> 1)
+        pairs.sort(key=lambda x: x[0])
+        betas = [p[0] for p in pairs]
+        samples = [p[1] for p in pairs]
+
+        def log_mean_exp(a):
+            m = np.max(a)
+            return m + np.log(np.mean(np.exp(a - m)))
+
+        total = 0.0
+        # stepping-stone product: sum_k log E_{beta_k}[ L^{delta_beta} ]
+        for k in range(len(betas) - 1):
+            delta = betas[k+1] - betas[k]
+            vals = delta * samples[k]
+            log_ratio = log_mean_exp(vals)
+            total += log_ratio
+
+        if betas[0] > 0:
+            print(f"Warning: smallest beta={betas[0]:.4g} > 0; estimate is logZ(1)-logZ({betas[0]:.4g}). Consider including beta=0 for full marginal likelihood.")
+
+        return total
