@@ -107,7 +107,7 @@ class likelihoodCalculator:
         else:
             raise ValueError("No model or qmatrix available for computing transition matrix")
     
-    def prune(self, node):
+    def prune(self, node, query=['loglik']):
         """
         Implement Felsenstein's pruning algorithm to compute likelihoods at internal nodes.
         Uses post-order traversal with explicit stack.
@@ -172,4 +172,15 @@ class likelihoodCalculator:
         site_liks = np.where(site_liks <= 0, 1e-300, site_liks)
         
         log_likelihood = np.sum(np.log(site_liks))
-        return log_likelihood
+
+        queries = {
+            'loglik': log_likelihood,
+            'site_liks': site_liks,
+            'root_lik_vec': root_lik_vec,
+        }
+
+        # compatibility for routine likelihood calculation
+        if query == ['loglik']:
+            return log_likelihood
+
+        return {q: queries[q] for q in query if q in queries}
