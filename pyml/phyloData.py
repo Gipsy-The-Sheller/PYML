@@ -3,6 +3,7 @@ from Bio.SeqRecord import SeqRecord
 from Bio.Align import MultipleSeqAlignment
 import pandas as pd
 import numpy as np
+from .file.bioPythonParser import BioPhylo2Topology
 
 RELEASE = False
 if RELEASE:
@@ -38,6 +39,12 @@ class Node:
     @property
     def is_leaf(self):
         return self.children is None
+
+class BioPhyloTopology(Topology):
+    def __init__(self, phylo):
+        topo = BioPhylo2Topology(phylo)
+        super().__init__(topo.nleaves)
+        self.nodes = topo.nodes
 
 class Topology:
     def __init__(self, n_leaves):
