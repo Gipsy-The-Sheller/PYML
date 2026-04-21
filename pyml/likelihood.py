@@ -184,3 +184,80 @@ class likelihoodCalculator:
             return log_likelihood
 
         return {q: queries[q] for q in query if q in queries}
+
+class PropInvLik(likelihoodCalculator):
+    """
+    Proportion invariant model
+    L = p * L_invariant + (1-p) * L_variable
+    """
+
+    def __init__(self, phyloData, model, propinv = 0.0, exceptions=None):
+        super().__init__(phyloData, model, exceptions)
+        self.likelihoodCalculator = super()
+        self.propinv = propinv
+    
+    def log_likelihood(self, params: dict):
+        # vectorize our computation
+        # method: consensus likelihood vectors of nodes (i.e. the consensus sequence) and identify invariant sites (obs)
+        
+        super().log_likelihood(params)
+
+        consensus = np.zeros(self.data_length * self.nstates)
+
+        for node in self.phyloData.tree.nodes:
+            if node.is_leaf:
+                consensus += node.metadata['lik_vector']
+        
+        # VECTORIZE!
+        # transfer 1: mark non-zero entries
+        consensus = np.where(consensus > 0, 1, 0)
+
+        # transfer 2: slice and sum to get per-site counts of non-zero states
+        statecounts = consensus.reshape(self.data_length, self.nstates).sum(axis=1)  # shape: (nsites,)
+
+        isinvariant = (statecounts == 1)
+
+        inv_liks = np.zeros(self.data_length)
+
+        for index, is_inv in enumerate(isinvariant):
+            if is_inv:
+                # the invariant site likelihood equals to that of the state frequency
+                lik_vec = consensus[index*self.nstates:(index+1)*self.nstates] * self.phyloData.qmatrix.freqs
+                inv_liks[index] = lik_vec.sum()
+        
+        # combine invariant and variable likelihoods
+        # NOTE: the variable likelihoods are log-transformed!
+
+        var_liks = np.exp(super().log_likelihood(params) - np.log(inv_liks + 1e-300))  # avoid log(0)
+        combined_liks = self.propinv * inv_liks + (1 - self.propinv) * var_liks
+
+        return np.sum(np.log(combined_liks + 1e-300))  # avoid log(0)
+
+class discreteGammaLik(likelihoodCalculator):
+
+    from .maths.distributions import gamma
+
+    def __init__(self, phyloData, model, gamma_shape=1.0, n_categories=4, exceptions=None):
+        self.gamma_shape = gamma_shape
+        self.n_categories = n_categories
+        self.category_rates = self._discretize_gamma(gamma_shape, n_categories)
+
+        # this is for invariable sites extension
+        self.init_categories(phyloData, model, exceptions)
+
+    def init_categories(self, phyloData, model, exceptions=None):
+        self.likelihoodCalculators = [likelihoodCalculator(phyloData, model, exceptions) for _ in range(self.n_categories)]
+    
+    def log_likelihood(self, params):
+        category_liks = [calculator.log_likelihood(params) for calculator in self.likelihoodCalculators]
+        return np.log(np.mean(np.exp(category_liks)))  # average likelihood across categories
+
+class discreteGammaInvLik(discreteGammaLik):
+
+    def __init__(self, phyloData, model, gamma_shape=1.0, n_categories=4, propinv=0.0, exceptions=None):
+        self.propinv = propinv
+        super().__init__(phyloData, model, gamma_shape, n_categories, exceptions)
+        
+    
+    def init_categories(self, phyloData, model, exceptions=None):
+        self.likelihoodCalculators = [PropInvLik(phyloData, model, self.propinv, exceptions) for _ in range(self.n_categories)]
