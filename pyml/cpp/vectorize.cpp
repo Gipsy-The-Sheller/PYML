@@ -1,6 +1,6 @@
-#include "vectorie.hpp"
-#include <vector>
+#include "vectorize.hpp"
 #include <cstddef>
+#include <vector>
 #include <immintrin.h>
 
 namespace VecMnpUtils {
@@ -82,7 +82,7 @@ using DefaultOps = ScalarOps;
 #endif
 
 template <typename Ops>
-inline std::vector<float> SinglePrecisionMultiplier(const float* queue1,
+std::vector<float> SinglePrecisionMultiplier(const float* queue1,
                                              const float* queue2,
                                              int qlength) {
     
@@ -105,14 +105,14 @@ inline std::vector<float> SinglePrecisionMultiplier(const float* queue1,
 }
 
 template <typename Ops>
-inline std::vector<double> DoublePrecisionMultiplier(const double* queue1,
+std::vector<double> DoublePrecisionMultiplier(const double* queue1,
                                               const double* queue2,
                                               int qlength) {
     if (qlength <= 0) return {};
     std::vector<double> res(qlength);
     int offset = 0;
 
-    for (; offset + Ops::WIDTH <= qlength; offset += Ops::WIDTH) {
+    for (; offset + Ops::WIDTH_PD <= qlength; offset += Ops::WIDTH_PD) {
         auto vecq1 = Ops::LOADVPD(queue1 + offset);
         auto vecq2 = Ops::LOADVPD(queue2 + offset);
         auto vecr  = Ops::MULTVPD(vecq1, vecq2);
@@ -132,5 +132,7 @@ template <Vectorable PRECISION> std::vector<PRECISION> Multiplier(const PRECISIO
     if constexpr (std::is_same_v<PRECISION, float>) return SinglePrecisionMultiplier(queue1, queue2, qlength);
     if constexpr (std::is_same_v<PRECISION, double>) return DoublePrecisionMultiplier(queue1, queue2, qlength);
 }
-}
 
+template std::vector<float> Multiplier<float>(const float*, const float*, int);
+template std::vector<double> Multiplier<double>(const double*, const double*, int);
+}
