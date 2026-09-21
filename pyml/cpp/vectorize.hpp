@@ -14,6 +14,12 @@ std::vector<Precision> Multiplier(const Precision* queue1,
                                   const Precision* queue2,
                                   int qlength);
 
+template <Vectorable Precision>
+void MultiplyAccumulate(Precision* destination,
+                        const Precision* values,
+                        Precision coefficient,
+                        int length);
+
 extern template std::vector<float> Multiplier<float>(
     const float*, const float*, int);
 extern template std::vector<double> Multiplier<double>(

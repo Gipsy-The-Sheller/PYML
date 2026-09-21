@@ -572,7 +572,8 @@ inline std::vector<Complex<T>> solveComplex(const std::vector<std::vector<Comple
             std::swap(M[piv], M[k]);
             std::swap(b[piv], b[k]);
         }
-        const Complex pivot = (std::abs(M[k][k]) < 1e-300) ? Complex(1e-300, 0.0) : M[k][k];
+        const Complex pivot = (std::abs(M[k][k]) < T{1e-300})
+            ? Complex(T{1e-300}, T{}) : M[k][k];
         for (int i = k + 1; i < n; ++i) {
             const Complex f = M[i][k] / pivot;
             if (f == C{}) continue;
@@ -661,7 +662,7 @@ template <std::floating_point T>
     for (int it = 0; it < 3; ++it) {
         y = solveComplex<T>(M, y);
         double norm{};
-        for (auto e : y) norm = std::max(norm, std::abs(e));
+        for (auto e : y) norm = std::max(norm, static_cast<double>(std::abs(e)));
         if (norm == 0.0 || !std::isfinite(norm)) { y.assign(n, C{T{1}, T{}}); continue; }
         for (auto& e : y) e /= norm;
     }
