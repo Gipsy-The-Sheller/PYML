@@ -896,13 +896,18 @@ template <std::floating_point T>
 ///   * e^{a t} [[cos bt,  sin bt],
 ///             [-sin bt, cos bt]]              for the pair a +/- i b
 /// Negative entries produced by round-off are clamped to zero.
+/// Non-allocating form: `out` receives P(t), `scratch` is workspace, and both
+/// must already be n x n where n is the eigen system's size.  A pruning loop
+/// evaluates this once per branch, so hoisting the two matrices out of the
+/// call keeps the inner loop free of heap traffic.
 template <std::floating_point T>
-[[nodiscard]] Matrix<T> transitionMatrix(const EigenSystem<T>& es, T t, T rate = T{1}) {
+void transitionMatrix(const EigenSystem<T>& es, T t, T rate,
+                      Matrix<T>& out, Matrix<T>& scratch) {
     const int n = static_cast<int>(es.real.size());
     const T dt = t * rate;
+    Matrix<T>& tmp = scratch;
 
     // tmp = B(t) * E^-1, built by rows (no matrix product)
-    Matrix<T> tmp{static_cast<std::size_t>(n), static_cast<std::size_t>(n), T{}};
     for (int i = 0; i < n;) {
         if (es.imag[i] != T{} && i + 1 < n) {
             const T a = es.real[i], b = es.imag[i];
@@ -922,14 +927,21 @@ template <std::floating_point T>
         }
     }
 
-    Matrix<T> P{static_cast<std::size_t>(n), static_cast<std::size_t>(n), T{}};
     for (int i = 0; i < n; ++i)
         for (int j = 0; j < n; ++j) {
             T s{};
             for (int k = 0; k < n; ++k) s += es.vectors(i, k) * tmp(k, j);
-            P(i, j) = s > T{} ? s : T{};
+            out(i, j) = s > T{} ? s : T{};
         }
-    return P;
+}
+
+template <std::floating_point T>
+[[nodiscard]] Matrix<T> transitionMatrix(const EigenSystem<T>& es, T t, T rate = T{1}) {
+    const std::size_t n = es.real.size();
+    Matrix<T> out{n, n, T{}};
+    Matrix<T> scratch{n, n, T{}};
+    transitionMatrix(es, t, rate, out, scratch);
+    return out;
 }
 
 /// Pack eigenvalues as beagleSetEigenDecomposition expects them:

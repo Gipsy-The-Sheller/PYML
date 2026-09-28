@@ -7,6 +7,7 @@
 #include <cmath>
 #include <algorithm>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -85,10 +86,18 @@ struct SubstMatrix {
         initialized = true;
     }
 
-    [[nodiscard]] std::vector<Precision> PMatrix(Precision t) const {
+    /// Writes P(t) into `out` (states x states, row-major), using `scratch`
+    /// (same shape) as workspace.  Both belong to the caller.
+    ///
+    /// This deliberately does not return a fresh matrix.  It is called twice
+    /// per internal node on every likelihood evaluation, and the previous
+    /// version allocated two matrices inside transitionMatrix() plus a vector
+    /// to return them in -- four heap allocations and a copy per branch, all
+    /// of it pure overhead in the pruning inner loop.
+    void PMatrix(Precision t, mpe::linalg::Matrix<Precision>& out,
+                 mpe::linalg::Matrix<Precision>& scratch) const {
         if (!initialized) throw std::logic_error("substitution matrix is not initialized");
-        const auto p = mpe::linalg::transitionMatrix(eigen, t);
-        return {p.data().begin(), p.data().end()};
+        mpe::linalg::transitionMatrix(eigen, t, Precision{1}, out, scratch);
     }
 };
 
@@ -108,6 +117,13 @@ public:
         sites_ = taxastates_.empty() ? 0 : taxastates_.front().size();
         for (const auto& row : taxastates_)
             if (row.size() != sites_) throw std::invalid_argument("alignment rows have different lengths");
+
+        // Workspace, sized once.  compute_node() runs once per internal node
+        // per likelihood evaluation, so none of this may be allocated there.
+        const std::size_t n = static_cast<std::size_t>(model_.states);
+        pmat_ = mpe::linalg::Matrix<Precision>{n, n, Precision{}};
+        pmat_scratch_ = mpe::linalg::Matrix<Precision>{n, n, Precision{}};
+        root_lik_.assign(sites_, Precision{});
         initialise_leaves();
     }
 
@@ -116,15 +132,23 @@ public:
         if (topology_.NODE_COUNT == 0) throw std::logic_error("tree is empty");
         const int root = topology_.root_index();
         compute_node(root);
-        Precision result{};
+
+        // Root reduction: sum over states of pi_j * L[j][site].  One pass along
+        // the site axis per state -- the shape the vector kernels are built
+        // for.  The previous form was a length-states dot product per site,
+        // with the reduction in a scalar accumulator, and could not vectorize.
         const auto& root_likelihood = topology_.Nodes[static_cast<std::size_t>(root)].likelihood;
-        for (std::size_t site = 0; site < sites_; ++site) {
-            Precision site_likelihood{};
-            for (int state = 0; state < model_.states; ++state)
-                site_likelihood += model_.Pis[static_cast<std::size_t>(state)] *
-                    root_likelihood[static_cast<std::size_t>(state) * sites_ + site];
-            result += std::log(std::max(site_likelihood, Precision{1e-300}));
-        }
+        std::fill(root_lik_.begin(), root_lik_.end(), Precision{});
+        for (int state = 0; state < model_.states; ++state)
+            VecMnpUtils::MultiplyAccumulate(
+                root_lik_.data(),
+                root_likelihood.data() + static_cast<std::size_t>(state) * sites_,
+                model_.Pis[static_cast<std::size_t>(state)],
+                static_cast<int>(sites_));
+
+        Precision result{};
+        for (std::size_t site = 0; site < sites_; ++site)
+            result += std::log(std::max(root_lik_[site], Precision{1e-300}));
         return result;
     }
 
@@ -136,6 +160,11 @@ private:
     SubstMatrix<Precision> model_;
     Alignment taxastates_;
     std::size_t sites_{};
+
+    // Workspace owned by the calculator rather than allocated per node.
+    mpe::linalg::Matrix<Precision> pmat_;          // states x states
+    mpe::linalg::Matrix<Precision> pmat_scratch_;  // same, for transitionMatrix
+    std::vector<Precision> root_lik_;              // sites
 
     void initialise_leaves() {
         for (int taxon = 0; taxon < topology_.TAXA_COUNT; ++taxon) {
@@ -155,37 +184,54 @@ private:
         }
     }
 
+    /// One Felsenstein partial:  parent[j][h] = sum_k P[j][k] * child[k][h],
+    /// over a states-major pair of blocks.
+    ///
+    /// This is the kernel that matters.  Expressing the same update as
+    /// states*states AXPYs -- one per (parent,child) state pair, which is what
+    /// this used to do -- re-streams the whole child block and rewrites the
+    /// whole accumulator for every pair.  The memory traffic is then
+    /// `states` times higher for identical arithmetic, and at the 4 states
+    /// phylogenetics uses that costs more than the 4-wide SIMD wins back.  It
+    /// measured slower than the plain scalar loop.  The kernel below walks the
+    /// site axis once, keeps the k-reduction in registers, and stores the
+    /// parent block once.
+    ///
+    /// `overwrite` false multiplies into the existing parent, which is what a
+    /// node's second child needs -- fused into the same pass rather than
+    /// costing another sweep over the parent.
+    void multiply_partial(Precision* parent, const Precision* child,
+                          const Precision* pmat, bool overwrite) const {
+        const auto sites = static_cast<long long>(sites_);
+        const int states = model_.states;
+        if constexpr (std::is_same_v<Precision, float>) {
+            if (overwrite) VecMnpUtils::PmatMulF32(parent, child, pmat, states, sites);
+            else           VecMnpUtils::PmatMulAccF32(parent, child, pmat, states, sites);
+        } else {
+            if (overwrite) VecMnpUtils::PmatMulF64(parent, child, pmat, states, sites);
+            else           VecMnpUtils::PmatMulAccF64(parent, child, pmat, states, sites);
+        }
+    }
+
     void compute_node(int index) {
         auto& node = topology_.Nodes[static_cast<std::size_t>(index)];
         if (node.IsTip()) return;
         compute_node(node.cleft_idx);
         compute_node(node.cright_idx);
-        const auto left_p = model_.PMatrix(topology_.Nodes[static_cast<std::size_t>(node.cleft_idx)].branch_length);
-        const auto right_p = model_.PMatrix(topology_.Nodes[static_cast<std::size_t>(node.cright_idx)].branch_length);
-        const auto& left = topology_.Nodes[static_cast<std::size_t>(node.cleft_idx)].likelihood;
-        const auto& right = topology_.Nodes[static_cast<std::size_t>(node.cright_idx)].likelihood;
-        node.likelihood.assign(sites_ * static_cast<std::size_t>(model_.states), Precision{});
-        std::vector<Precision> left_sum(sites_);
-        std::vector<Precision> right_sum(sites_);
-        for (int parent_state = 0; parent_state < model_.states; ++parent_state) {
-            std::fill(left_sum.begin(), left_sum.end(), Precision{});
-            std::fill(right_sum.begin(), right_sum.end(), Precision{});
-            for (int child_state = 0; child_state < model_.states; ++child_state) {
-                VecMnpUtils::MultiplyAccumulate(
-                    left_sum.data(),
-                    left.data() + static_cast<std::size_t>(child_state) * sites_,
-                    left_p[static_cast<std::size_t>(parent_state * model_.states + child_state)],
-                    static_cast<int>(sites_));
-                VecMnpUtils::MultiplyAccumulate(
-                    right_sum.data(),
-                    right.data() + static_cast<std::size_t>(child_state) * sites_,
-                    right_p[static_cast<std::size_t>(parent_state * model_.states + child_state)],
-                    static_cast<int>(sites_));
-            }
-            for (std::size_t site = 0; site < sites_; ++site) {
-                node.likelihood[static_cast<std::size_t>(parent_state) * sites_ + site] =
-                    left_sum[site] * right_sum[site];
-            }
+
+        // resize, not assign: the kernel below writes every element of the
+        // first child's contribution, so pre-filling is wasted work.  After
+        // the first call the size is already right and this is a no-op.
+        const std::size_t block = sites_ * static_cast<std::size_t>(model_.states);
+        if (node.likelihood.size() != block) node.likelihood.resize(block);
+        auto* parent = node.likelihood.data();
+
+        const int children[2] = {node.cleft_idx, node.cright_idx};
+        for (int slot = 0; slot < 2; ++slot) {
+            const auto& child = topology_.Nodes[static_cast<std::size_t>(children[slot])];
+            model_.PMatrix(child.branch_length, pmat_, pmat_scratch_);
+            multiply_partial(parent, child.likelihood.data(),
+                             pmat_.data().data(), slot == 0);
         }
     }
 };
