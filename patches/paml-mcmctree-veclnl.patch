@@ -1,0 +1,577 @@
+diff --git a/src/mcmctree.c b/src/mcmctree.c
+index e0ce569..89455db 100644
+--- a/src/mcmctree.c
++++ b/src/mcmctree.c
+@@ -21,6 +21,10 @@
+ 
+ #include "paml.h"
+ 
++/* pyml vector kernels, for the optional vecLnL path.  Build with
++   -I<repo>/pyml/cpp and link vectorize.o + vectorize_c.o. */
++#include "vectorize_c.h"
++
+ 
+ #define NS            1025
+ #define NBRANCH      (NS*2-2)
+@@ -47,6 +51,8 @@ int ReadBlengthGH(char infile[]);
+ int GenerateBlengthGH(char infile[]);
+ int GetMem(void);
+ void FreeMem(void);
++int ConditionalPNodeVec(int inode, int igene, double x[]);
++int GetPMatBranch2(double PMat[], double t);
+ int UseLocus(int locus, int copycondP, int setmodel, int setSeqName);
+ int AcceptRejectLocus(int locus, int accept);
+ void switchconPin(void);
+@@ -108,6 +114,12 @@ struct CommonInfo {
+    size_t sconP;
+    double *conPin[2], space[1000000];  /* change space[] to dynamic memory? */
+    int conPSiteClass, NnodeScale;
++   /* vecLnL: run the SIMD pruning path (see ConditionalPNodeVec).  Same
++      double-buffered layout as conPin[], only the element order inside each
++      node block differs.  Default 0 leaves the scalar path bit-for-bit
++      unchanged. */
++   int vecLnL;
++   double *vecConPin[2];
+    char *nodeScale;          /* nScale[ns-1] for interior nodes */
+    double *nodeScaleF;       /* nScaleF[npatt] for scale factors */
+ }  com;
+@@ -130,6 +142,13 @@ struct TREEB {
+ struct TREEN { /* ipop is node number in species tree */
+    int father, nson, sons[2], ibranch, ipop;
+    double branch, age, label, label2, *conP;
++   /* vecLnL only: same block as conP but stored state-major,
++      vecConP[j*npatt + h] instead of conP[h*ncode + j].  Kept as a separate
++      pointer rather than derived from conP so that it mirrors conP through
++      every switchconPin()/UseLocus() repositioning without extra arithmetic.
++      Tips are not stored here; their contribution is data-only and lives in
++      vecTipInd[].  Unused (and left NULL) when vecLnL = 0. */
++   double *vecConP;
+    char fossil, *name, *annotation;
+ }  *nodes, **gnodes, nodes_t[2 * NS - 1];
+ /* nodes_t[] is working space.  nodes is a pointer and moves around.
+@@ -210,6 +229,23 @@ char *clockstr[] = { "", "Global clock", "Independent rates", "Autocorrelated ra
+ enum B_Transforms { SQRT_B = 1, LOG_B, ARCSIN_B };
+ char *Btransform[] = { "", "square root", "logarithm", "arcsin" };
+ 
++/* vecLnL lives in the mcmctree part below, but lfun() -- which treesub.c
++   supplies and which is textually included here -- needs to reach it.  These
++   declarations have to precede the #include. */
++static double *vecRootLik;
++static void VecRootLik(void);
++/* vecLnL = 2 verification mode: run both paths on the same parameters and
++   report the per-pattern difference of the root likelihood vector. */
++static void VecStashScalarRoot(void);
++static void VecReportRootDiff(void);
++/* Time actually spent inside the sequence likelihood, accumulated in
++   lnpD_locus().  The MCMC's own overhead is a large constant share of a short
++   run and would otherwise mask what the pruning costs. */
++static clock_t vecLikClock;
++static long    vecLikCalls;
++/* sub-timers, to say where inside the likelihood the time went */
++static clock_t vecPruneClock, vecRootClock;
++
+ #define MCMCTREE  1
+ #include "treesub.c"
+ 
+@@ -668,6 +704,247 @@ int CombineMCMCFiles_CommandLine(int argc, char *argv[])
+    return 0;
+ }
+ 
++/* ===================== vecLnL: SIMD likelihood path =======================
++   An optional second implementation of the pruning algorithm, selected by
++   `vecLnL = 1` in the control file.  The scalar ConditionalPNode() below is
++   left completely untouched, so the two can be A/B compared inside one binary
++   and the results checked against each other.
++
++   Why the memory layout changes.  The scalar path stores a node's conditional
++   probabilities pattern-major, conP[h*ncode + j], and its inner loop is
++
++       for (j) { t = 0; for (k) t += PMat[j*n+k] * child[h*n+k]; parent[h*n+j] *= t; }
++
++   a length-`ncode` dot product with the reduction in a scalar accumulator.
++   There is no axis there a compiler can vectorize against.  Here each node
++   block is stored state-major instead, vecConP[j*npatt + h], so that the
++   pattern axis -- the only long axis in the problem -- becomes contiguous.
++
++   How the kernel is written matters more than the layout.  The obvious
++   translation is ncode*ncode AXPYs (pyml_vec_muladd_f64), one per (j,k), and
++   that is in fact what pyml/cpp/likelihood.hpp does.  Measured against PAML
++   it comes out *slower* than the scalar code: each AXPY streams the whole
++   child block and rewrites the whole accumulator, so the memory traffic is
++   ncode times higher, and for ncode = 4 that costs more than the 4-wide SIMD
++   wins back.  pyml_vec_pmat_mul_f64() instead walks the pattern axis once,
++   loads each tile of the child into registers, reduces over k there, and
++   stores the parent tile once -- the same traffic as the scalar loop.
++
++   Tips are not stored at all.  A tip's contribution to its parent,
++
++       sum_k PMat[j][k] * L_tip[k][h]   with  L_tip[k][h] = delta(k, z[h]),
++
++   depends only on the data -- never on branch lengths or model parameters --
++   so it is folded once per locus into a state-major 0/1 indicator block
++   (vecTipInd[]).  Clean and ambiguous sites are handled uniformly: an
++   ambiguous code simply lights up more than one state in its column, which
++   reproduces PAML's unweighted sum over CharaMap[] (see the !com.cleandata
++   branch of ConditionalPNode).  Avoiding a per-pattern gather of
++   PMat[j*n + z[h]] is worth roughly a factor of two on the tip branches, and
++   tips are half the branches of a tree.
++
++   Deliberately NOT done here: node scaling.  com.NnodeScale is only ever
++   assigned inside a comment block in this file, so the guard at the end of
++   ConditionalPNode() can never fire under mcmctree.
++   ========================================================================= */
++
++static double *vecTipInd = NULL;      /* [tip][k*npatt + h], one locus at a time */
++static size_t  vecTipIndSize = 0;     /* capacity, in doubles */
++static int     vecTipIndLocus = -1;   /* locus the blocks currently describe */
++static double *vecRootLik = NULL;     /* root reduction, length npatt */
++static size_t  vecRootLikSize = 0;
++static double *vecRootLikRef = NULL;  /* scalar reference, vecLnL = 2 only */
++static size_t  vecRootLikRefSize = 0;
++static long    vecCmpCalls = 0;
++static double  vecCmpMaxAbs = 0.0, vecCmpMaxRel = 0.0;
++
++static void AllocVecWorkspace(void)
++{
++   /* Size the workspace for the largest locus over all genes.  GetMem() knows
++      every locus's npatt and ns, so a single pass is enough. */
++   int locus, n = com.ncode;
++   size_t ind = 0, rootlik = 0, need;
++
++   for (locus = 0; locus < data.ngene; locus++) {
++      need = (size_t)n * data.npatt[locus];
++      if (need > rootlik) rootlik = need / (n > 0 ? (size_t)n : 1);
++      need *= (size_t)data.ns[locus];
++      if (need > ind) ind = need;
++   }
++   if (ind > vecTipIndSize) {
++      free(vecTipInd);
++      vecTipInd = (double*)malloc(ind * sizeof(double));
++      if (vecTipInd == NULL) zerror("oom vecTipInd");
++      vecTipIndSize = ind;
++   }
++   if (rootlik > vecRootLikSize) {
++      free(vecRootLik);
++      vecRootLik = (double*)malloc(rootlik * sizeof(double));
++      if (vecRootLik == NULL) zerror("oom vecRootLik");
++      vecRootLikSize = rootlik;
++   }
++   if (com.vecLnL >= 2 && rootlik > vecRootLikRefSize) {
++      free(vecRootLikRef);
++      vecRootLikRef = (double*)malloc(rootlik * sizeof(double));
++      if (vecRootLikRef == NULL) zerror("oom vecRootLikRef");
++      vecRootLikRefSize = rootlik;
++   }
++   vecTipIndLocus = -1;      /* force a rebuild for the first locus seen */
++}
++
++
++static void FreeVecWorkspace(void)
++{
++   if (vecCmpCalls)
++      printf("\nvecLnL=2 verification: %ld likelihood evaluations compared,\n"
++             "  worst per-pattern abs difference %.3e\n"
++             "  worst per-pattern relative difference %.3e\n",
++             vecCmpCalls, vecCmpMaxAbs, vecCmpMaxRel);
++   free(vecTipInd);  vecTipInd = NULL;  vecTipIndSize = 0;
++   free(vecRootLik); vecRootLik = NULL; vecRootLikSize = 0;
++   free(vecRootLikRef); vecRootLikRef = NULL; vecRootLikRefSize = 0;
++   vecTipIndLocus = -1;
++   free(com.vecConPin[0]);
++   com.vecConPin[0] = com.vecConPin[1] = NULL;
++}
++
++
++static void BuildVecTipInd(int locus)
++{
++   /* Fold one locus's tips into 0/1 indicator blocks.  Called from UseLocus(),
++      so the block is rebuilt exactly when the locus changes and then reused
++      for the rest of the MCMC -- the data never changes under it. */
++   int tip, h, k, npatt = data.npatt[locus], n = com.ncode;
++   const size_t block = (size_t)n * npatt;
++   double *ind = vecTipInd;
++
++   if (vecTipInd == NULL || vecTipIndLocus == locus || npatt <= 0) return;
++
++   for (tip = 0; tip < data.ns[locus]; tip++) {
++      const char *z = data.z[locus][tip];
++      memset(ind, 0, block * sizeof(double));
++      if (data.cleandata[locus]) {                 /* z[] holds a state index */
++         for (h = 0; h < npatt; h++) {
++            const int state = (int)(unsigned char)z[h];
++            if (state >= 0 && state < n) ind[(size_t)state * npatt + h] = 1.0;
++         }
++      }
++      else {                                       /* z[] holds a code index */
++         for (h = 0; h < npatt; h++) {
++            const int code = (int)(unsigned char)z[h];
++            for (k = 0; k < nChara[code]; k++)
++               ind[(size_t)CharaMap[code][k] * npatt + h] = 1.0;
++         }
++      }
++      ind += block;
++   }
++   vecTipIndLocus = locus;
++}
++
++
++static void VecRootLik(void)
++{
++   /* Per-pattern likelihood at the root: sum_j pi[j] * vecConP[j][h].  This is
++      the same AXPY reduction pyml's own kernel applies in LogLikPruner(). */
++   int j, npatt = com.npatt;
++   const double *root = nodes[tree.root].vecConP;
++
++   pyml_vec_fill_f64(vecRootLik, 0.0, npatt);
++   for (j = 0; j < com.ncode; ++j)
++      pyml_vec_muladd_f64(vecRootLik, root + (size_t)j * npatt, com.pi[j], npatt);
++}
++
++
++/* ---- vecLnL = 2: numerical equivalence check ------------------------------
++   mcmc.txt prints lnL with three decimals, so comparing sampled traces cannot
++   resolve better than ~1e-3 on a value near -1e4.  In verification mode lfun()
++   runs BOTH implementations on the same parameters and hands the two root
++   likelihood vectors here.  Comparing the vectors directly, at full double
++   precision, tests every pattern rather than just the aggregate. */
++
++static void VecStashScalarRoot(void)
++{
++   /* Exactly the reduction lfun() would have done, kept separate. */
++   int h, i, npatt = com.npatt;
++   const double *root = nodes[tree.root].conP;
++
++   for (h = 0; h < npatt; h++) {
++      double fh = 0;
++      for (i = 0; i < com.ncode; i++)
++         fh += com.pi[i] * root[h * com.ncode + i];
++      vecRootLikRef[h] = fh;
++   }
++}
++
++
++static void VecReportRootDiff(void)
++{
++   int h, npatt = com.npatt;
++   double absmax = 0, relmax = 0;
++
++   for (h = 0; h < npatt; h++) {
++      const double a = vecRootLikRef[h], b = vecRootLik[h];
++      const double d = fabs(a - b);
++      if (d > absmax) absmax = d;
++      if (a != 0 && d / fabs(a) > relmax) relmax = d / fabs(a);
++   }
++   ++vecCmpCalls;
++   if (absmax > vecCmpMaxAbs) vecCmpMaxAbs = absmax;
++   if (relmax > vecCmpMaxRel) vecCmpMaxRel = relmax;
++   if (vecCmpCalls <= 5)
++      printf("vecLnL=2 check %6ld: npatt %6d  max abs %.3e  max rel %.3e\n",
++             vecCmpCalls, npatt, absmax, relmax);
++   else if (vecCmpCalls % 500 == 0)
++      printf("vecLnL=2 running max over %ld checks: abs %.3e  rel %.3e\n",
++             vecCmpCalls, vecCmpMaxAbs, vecCmpMaxRel);
++}
++
++
++int ConditionalPNodeVec(int inode, int igene, double x[])
++{
++   /* Same recursion and the same conP caching as ConditionalPNode(), but the
++      node blocks are state-major and the inner loops are AXPYs. */
++   int i, ison, n = com.ncode, npatt = com.npatt;
++   double t, *parent;
++
++   if (nodes[inode].nson < 1) return (0);
++
++   for (i = 0; i < nodes[inode].nson; i++) {
++      ison = nodes[inode].sons[i];
++      if (nodes[ison].nson > 0 && !com.oldconP[ison])
++         ConditionalPNodeVec(ison, igene, x);
++   }
++
++   parent = nodes[inode].vecConP;
++   for (i = 0; i < nodes[inode].nson; i++) {
++      ison = nodes[inode].sons[i];
++
++      t = nodes[ison].branch * _rateSite;
++      if (t < 0) {
++         printf("\nt =%12.6f ratesite = %.6f", nodes[ison].branch, _rateSite);
++         zerror("blength < 0");
++      }
++      GetPMatBranch2(PMat, t);
++
++      /* This child's contribution: sum_k PMat[j][k]*L[k][h].  A tip reads its
++         precomputed indicator block, an internal node its own vecConP.  The
++         kernel is one pass over the pattern axis with the k-reduction held in
++         registers -- see the note on pyml_vec_pmat_mul_f64().
++         The first child seeds the parent and the rest multiply in, which is
++         what PAML's "conP[] = 1 then *= each child" amounts to; the multiply
++         is fused into the same pass rather than costing a second sweep. */
++      {
++         const double *child = (nodes[ison].nson < 1)
++            ? vecTipInd + (size_t)ison * (size_t)n * npatt
++            : nodes[ison].vecConP;
++         if (i == 0) pyml_vec_pmat_mul_f64(parent, child, PMat, n, npatt);
++         else        pyml_vec_pmat_mul_acc_f64(parent, child, PMat, n, npatt);
++      }
++   }
++   return (0);
++}
++
++
+ int GetMem(void)
+ {
+    /* This allocates memory for conditional probabilities (conP).
+@@ -718,6 +995,22 @@ int GetMem(void)
+          }
+       }
+ 
++      /* vecLnL: a parallel double buffer for the state-major path.  Same size
++         and same node-block organisation as conPin[], so conP_offset[] applies
++         unchanged -- only the element order within a node block differs. */
++      if (com.vecLnL) {
++         if ((com.vecConPin[0] = (double*)malloc(2 * com.sconP)) == NULL)
++            zerror("oom vecConP");
++         com.vecConPin[1] = com.vecConPin[0] + com.sconP / sizeof(double);
++         for (locus = 0; locus < g; locus++) {
++            conP = com.vecConPin[0] + data.conP_offset[locus];
++            for (j = data.ns[locus]; j < data.ns[locus] * 2 - 1; j++, conP += com.ncode*data.npatt[locus])
++               gnodes[locus][j].vecConP = conP;
++         }
++         printf("%zu bytes for vecConP\n", 2 * com.sconP);
++         AllocVecWorkspace();
++      }
++
+       if (!com.fix_alpha) {
+          for (locus = 0; locus < g; locus++)
+             sfhK = max2(sfhK, data.npatt[locus]);
+@@ -776,11 +1069,24 @@ void FreeMem(void)
+ {
+    int locus, j;
+ 
++   if (vecLikCalls)
++      printf("\nlikelihood timing: %ld evaluations, %.3f s of CPU in the "
++             "sequence likelihood (%.1f us each); %.3f s total process CPU\n",
++             vecLikCalls, (double)vecLikClock / CLOCKS_PER_SEC,
++             1e6 * (double)vecLikClock / CLOCKS_PER_SEC / (double)vecLikCalls,
++             (double)clock() / CLOCKS_PER_SEC);
++   if (com.vecLnL == 1)
++      printf("  of which: pruning %.3f s, root reduction %.3f s\n",
++             (double)vecPruneClock / CLOCKS_PER_SEC,
++             (double)vecRootClock / CLOCKS_PER_SEC);
++
+    for (locus = 0; locus < data.ngene; locus++)
+       free(gnodes[locus]);
+    free(gnodes);
+    if (mcmc.usedata)
+       free(com.conPin[0]);
++   if (com.vecLnL)
++      FreeVecWorkspace();
+    if (mcmc.usedata == 1) {
+       for (locus = 0; locus < data.ngene; locus++) {
+          if (data.datatype[locus] == MORPHC) {
+@@ -902,16 +1208,30 @@ int UseLocus(int locus, int copyconP, int setModel, int setSeqName)
+    */
+    int i, s1 = com.ncode*data.npatt[locus], sG = (com.conPSiteClass ? com.ncatG : 1);
+    double *conPt = com.conPin[!com.curconP] + data.conP_offset[locus];
++   double *vecConPt = (com.vecLnL ? com.vecConPin[!com.curconP] + data.conP_offset[locus] : NULL);
+ 
+    com.ns = data.ns[locus];
+    com.ls = data.ls[locus];
+    tree.root = data.root[locus];
+    tree.nnode = 2 * com.ns - 1;
+    nodes = gnodes[locus];
++   if (com.vecLnL)
++      BuildVecTipInd(locus);       /* no-op unless the locus actually changed */
+    if (copyconP && mcmc.usedata == 1) { /* this preserves the old conP. */
+-      memcpy(conPt, gnodes[locus][com.ns].conP, sG*s1*(com.ns - 1) * sizeof(double));
+-      for (i = com.ns; i < tree.nnode; i++)
++      /* Only the buffer of a path that is actually running is copied.  This
++         memcpy happens once per MCMC iteration and moves (ns-1)*ncode*npatt
++         doubles -- for 64 taxa that is ~10 MB a time -- so copying a buffer
++         nobody reads would double the cost of the whole proposal step.
++         vecLnL = 2 runs both paths, so both are copied. */
++      if (com.vecLnL != 1)
++         memcpy(conPt, gnodes[locus][com.ns].conP, sG*s1*(com.ns - 1) * sizeof(double));
++      if (com.vecLnL)
++         memcpy(vecConPt, gnodes[locus][com.ns].vecConP, sG*s1*(com.ns - 1) * sizeof(double));
++      for (i = com.ns; i < tree.nnode; i++) {
+          nodes[i].conP = conPt + (i - com.ns)*s1;
++         if (com.vecLnL)
++            nodes[i].vecConP = vecConPt + (i - com.ns)*s1;
++      }
+    }
+ 
+    if (setModel && mcmc.usedata == 1) {
+@@ -961,13 +1281,22 @@ int AcceptRejectLocus(int locus, int accept)
+    */
+    int i, ns = data.ns[locus], s1 = com.ncode*data.npatt[locus], sG = 1;
+    double *conP = com.conPin[com.curconP] + data.conP_offset[locus];
++   double *vecConP = (com.vecLnL ? com.vecConPin[com.curconP] + data.conP_offset[locus] : NULL);
+ 
+    if (mcmc.usedata == 1) {
+       if (com.conPSiteClass) sG = com.ncatG;
+-      if (accept)
+-         memcpy(conP, gnodes[locus][ns].conP, sG*s1*(ns - 1) * sizeof(double));
+-      for (i = ns; i < ns * 2 - 1; i++)
++      if (accept) {
++         /* see UseLocus(): copy only what the active path reads */
++         if (com.vecLnL != 1)
++            memcpy(conP, gnodes[locus][ns].conP, sG*s1*(ns - 1) * sizeof(double));
++         if (com.vecLnL)
++            memcpy(vecConP, gnodes[locus][ns].vecConP, sG*s1*(ns - 1) * sizeof(double));
++      }
++      for (i = ns; i < ns * 2 - 1; i++) {
+          gnodes[locus][i].conP = conP + (i - ns)*s1;
++         if (com.vecLnL)
++            gnodes[locus][i].vecConP = vecConP + (i - ns)*s1;
++      }
+    }
+    return(0);
+ }
+@@ -982,14 +1311,18 @@ void switchconPin(void)
+       repositioning for site classes is achieved in fx_r().
+    */
+    int i, locus;
+-   double *conP;
++   double *conP, *vecConP;
+ 
+    com.curconP = !com.curconP;
+ 
+    for (locus = 0; locus < data.ngene; locus++) {
+       conP = com.conPin[com.curconP] + data.conP_offset[locus];
+-      for (i = data.ns[locus]; i < data.ns[locus] * 2 - 1; i++, conP += com.ncode*data.npatt[locus])
++      vecConP = (com.vecLnL ? com.vecConPin[com.curconP] + data.conP_offset[locus] : NULL);
++      for (i = data.ns[locus]; i < data.ns[locus] * 2 - 1; i++, conP += com.ncode*data.npatt[locus]) {
+          gnodes[locus][i].conP = conP;
++         if (com.vecLnL)
++            gnodes[locus][i].vecConP = vecConP + (i - data.ns[locus]) * com.ncode * data.npatt[locus];
++      }
+    }
+ }
+ 
+@@ -1162,8 +1495,17 @@ double lnpD_locus(int locus)
+    }
+    if (mcmc.usedata == 1 && data.datatype[locus] == MORPHC)
+       lnL = lnLmorphF73(data.root[locus], locus, &t);
+-   else if (mcmc.usedata == 1)
++   else if (mcmc.usedata == 1) {
++      /* Time the sequence likelihood on its own.  The MCMC's own overhead
++         (proposals, priors, tree bookkeeping) is a large and roughly constant
++         share of a short run, so end-to-end wall clock hides what the pruning
++         actually costs -- this is the number that matters for a kernel
++         comparison.  Compiled into every arm of the benchmark. */
++      const clock_t likTic = clock();
+       lnL = -com.plfun(NULL, -1);
++      vecLikClock += clock() - likTic;
++      ++vecLikCalls;
++   }
+    else if (mcmc.usedata == 2)
+       lnL = lnpD_locus_Approx(locus);
+ 
+@@ -1494,13 +1836,13 @@ int GenerateBlengthGH(char infile[])
+ int GetOptions(char *ctlf)
+ {
+    int  transform0 = ARCSIN_B; /* default transform: SQRT_B, LOG_B, ARCSIN_B */
+-   int  iopt, i, j, nopt = 32, lline = 4096;
++   int  iopt, i, j, nopt = 33, lline = 4096;
+    char line[4096], *pline, opt[33], *comment = "*#", ch;
+    char *optstr[] = { "seed", "seqfile","treefile", "outfile", "mcmcfile", "checkpoint", "BayesFactorBeta",
+         "seqtype", "aaRatefile", "icode", "noisy", "usedata", "ndata", "duplication", "model", "clock",
+         "TipDate", "RootAge", "fossilerror", "alpha", "ncatG", "cleandata",
+-        "BDparas", "kappa_gamma", "alpha_gamma", "rgene_gamma", "sigma2_gamma", 
+-        "print", "burnin", "sampfreq", "nsample", "finetune" };
++        "BDparas", "kappa_gamma", "alpha_gamma", "rgene_gamma", "sigma2_gamma",
++        "print", "burnin", "sampfreq", "nsample", "finetune", "vecLnL" };
+    double t = 1, *eps = mcmc.steplength;
+    FILE  *fctl = zfopen(ctlf, "r");
+ 
+@@ -1616,6 +1958,7 @@ int GetOptions(char *ctlf)
+                   break;
+                   sscanf(pline + 1, "%d:%lf%lf%lf%lf%lf%lf", &j, eps, eps + 1, eps + 2, eps + 3, eps + 4, eps + 5);
+                   break;
++               case (32): com.vecLnL = (int)t;      break;
+                }
+                break;
+             }
+@@ -1647,6 +1990,28 @@ int GetOptions(char *ctlf)
+       com.ncode = 20;
+ 
+    if (com.alpha == 0) { com.fix_alpha = 1; com.nalpha = 0; }
++
++   /* vecLnL is implemented for the single-rate lfun() route only.  The
++      discrete-gamma route (lfundG -> fx_r) carries an extra site-class
++      dimension through the conP blocks; refuse it rather than compute
++      something quietly wrong.
++        0 = scalar path (default, PAML behaviour unchanged)
++        1 = SIMD path
++        2 = run both on the same parameters and report the difference */
++   if (com.vecLnL) {
++      if (com.vecLnL < 0 || com.vecLnL > 2)
++         zerror("vecLnL should be 0 (scalar), 1 (SIMD) or 2 (verify both)");
++      if (mcmc.usedata != 1)
++         zerror("vecLnL requires usedata = 1 (exact sequence likelihood)");
++      if (com.alpha != 0)
++         zerror("vecLnL does not support alpha > 0 (discrete gamma); set alpha = 0");
++      if (com.seqtype != 0)
++         zerror("vecLnL supports nucleotides only");
++      printf("\nvecLnL = %d: %s, %d doubles per SIMD register, FMA %s\n",
++             com.vecLnL, pyml_vec_isa_name(), pyml_vec_width_f64(),
++             pyml_vec_has_fma() ? "on" : "off");
++   }
++
+    if (com.clock < 1 || com.clock>3) zerror("clock should be 1, 2, 3?");
+    if (mcmc.burnin <= 0) puts("burnin=0: no automatic step adjustment?");
+ 
+diff --git a/src/treesub.c b/src/treesub.c
+index 45074cb..1407156 100644
+--- a/src/treesub.c
++++ b/src/treesub.c
+@@ -7773,12 +7773,46 @@ double lfun(double x[], int np)
+    for (ig = 0; ig < com.ngene; ig++) {
+       if (com.Mgene > 1)
+          SetPGene(ig, 1, 1, 0, x);
++#ifdef MCMCTREE
++      /* vecLnL: optional SIMD pruning, see ConditionalPNodeVec().  The root
++         reduction is folded into the same state-major layout: one AXPY per
++         state over all patterns, instead of a length-ncode dot product per
++         pattern.  Undefined everywhere except the mcmctree build. */
++      if (com.vecLnL == 2) {
++         /* verification mode: both implementations, same parameters, then the
++            scalar result is what the run itself proceeds with */
++         ConditionalPNode(tree.root, ig, x);
++         VecStashScalarRoot();
++         ConditionalPNodeVec(tree.root, ig, x);
++         VecRootLik();
++         VecReportRootDiff();
++      }
++      else if (com.vecLnL) {
++         clock_t tc = clock();
++         ConditionalPNodeVec(tree.root, ig, x);
++         { const clock_t t = clock(); vecPruneClock += t - tc; tc = t; }
++         VecRootLik();
++         vecRootClock += clock() - tc;
++      }
++      else
++         ConditionalPNode(tree.root, ig, x);
++#else
+       ConditionalPNode(tree.root, ig, x);
++#endif
+ 
+       for (h = com.posG[ig]; h < com.posG[ig + 1]; h++) {
+          if (com.fpatt[h] <= 0 && com.print >= 0) continue;
+-         for (i = 0, fh = 0; i < com.ncode; i++)
+-            fh += com.pi[i] * nodes[tree.root].conP[h * com.ncode + i];
++#ifdef MCMCTREE
++         if (com.vecLnL == 1) {
++            fh = vecRootLik[h];
++         }
++         else
++#endif
++         {
++            fh = 0;
++            for (i = 0; i < com.ncode; i++)
++               fh += com.pi[i] * nodes[tree.root].conP[h * com.ncode + i];
++         }
+          if (fh <= 0) {
+             if (fh < -1e-5 && noisy) {
+                printf("\nfh = %.6f negative\n", fh);
