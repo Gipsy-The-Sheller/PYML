@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -13,18 +14,26 @@
 
 namespace PYML {
 
+/// One node of a rooted tree.  Up to three children: a binary root has two,
+/// and rooting an *unrooted* tree at an internal node makes that node
+/// trifurcating, which is how MrBayes-style unrooted trees are represented.
+/// Felsenstein's pruning does not care how many children a node has -- PAML's
+/// ConditionalPNode() loops over nodes[inode].nson the same way.
 template <VecMnpUtils::Vectorable Precision>
 struct Node {
+    static constexpr int MAX_CHILDREN = 3;
     int parent_idx{-1};
-    int cleft_idx{-1};
-    int cright_idx{-1};
+    std::array<int, MAX_CHILDREN> child_idx{-1, -1, -1};
+    int n_child{0};
     Precision branch_length{};
     std::vector<Precision> likelihood;
 
-    [[nodiscard]] bool IsTip() const noexcept {
-        return cleft_idx < 0 && cright_idx < 0;
-    }
+    [[nodiscard]] bool IsTip() const noexcept { return n_child == 0; }
     [[nodiscard]] bool IsRoot() const noexcept { return parent_idx < 0; }
+
+    // Kept so existing two-child code reads unchanged.
+    [[nodiscard]] int cleft_idx() const noexcept { return child_idx[0]; }
+    [[nodiscard]] int cright_idx() const noexcept { return child_idx[1]; }
 };
 
 template <VecMnpUtils::Vectorable Precision>
@@ -48,14 +57,49 @@ struct BinaryTree {
         throw std::invalid_argument("tree has no root");
     }
 
-    void connect(int parent, int left, int right) {
-        if (parent < 0 || left < 0 || right < 0 ||
-            parent >= NODE_COUNT || left >= NODE_COUNT || right >= NODE_COUNT)
+    void connect(int parent, const int* kids, int count) {
+        if (parent < 0 || parent >= NODE_COUNT)
             throw std::out_of_range("tree node index out of range");
-        Nodes[parent].cleft_idx = left;
-        Nodes[parent].cright_idx = right;
-        Nodes[left].parent_idx = parent;
-        Nodes[right].parent_idx = parent;
+        if (count < 0 || count > static_cast<int>(Node<Precision>::MAX_CHILDREN))
+            throw std::invalid_argument("too many children for one node");
+        auto& p = Nodes[static_cast<std::size_t>(parent)];
+        p.n_child = 0;
+        for (int s = 0; s < count; ++s) {
+            const int k = kids[s];
+            if (k < 0 || k >= NODE_COUNT) throw std::out_of_range("tree node index out of range");
+            p.child_idx[static_cast<std::size_t>(p.n_child++)] = k;
+            Nodes[static_cast<std::size_t>(k)].parent_idx = parent;
+        }
+    }
+
+    void connect(int parent, std::initializer_list<int> kids) {
+        connect(parent, kids.begin(), static_cast<int>(kids.size()));
+    }
+
+    void connect(int parent, const std::vector<int>& kids) {
+        connect(parent, kids.data(), static_cast<int>(kids.size()));
+    }
+
+    void connect(int parent, int left, int right) { connect(parent, {left, right}); }
+
+    /// An *unrooted* N-taxon tree, stored as a rooted tree whose root is an
+    /// internal node of degree three.  Node count is 2N-2 (N tips, N-2
+    /// internal) and edge count 2N-3 -- one fewer than the rooted layout
+    /// above, because the root has no branch of its own.  Every non-root node
+    /// carries exactly one branch, the one above it, so branch lengths are
+    /// indexed by node and brlen[root] is unused.
+    ///
+    /// This is how MrBayes represents unrooted trees, and Felsenstein's
+    /// pruning is indifferent to where the tree is rooted, so the existing
+    /// likelihood code takes this layout unchanged.
+    [[nodiscard]] static BinaryTree Unrooted(int taxa_count) {
+        if (taxa_count < 1) throw std::invalid_argument("taxa_count must be positive");
+        BinaryTree t;
+        t.TAXA_COUNT = taxa_count;
+        t.NODE_COUNT = 2 * taxa_count - 2;
+        t.BRANCH_COUNT = 2 * taxa_count - 3;
+        t.Nodes.resize(static_cast<std::size_t>(t.NODE_COUNT));
+        return t;
     }
 };
 
@@ -153,7 +197,15 @@ public:
     }
 
     BinaryTree<Precision>& topology() noexcept { return topology_; }
+    const BinaryTree<Precision>& topology() const noexcept { return topology_; }
     const SubstMatrix<Precision>& model() const noexcept { return model_; }
+
+    /// Non-const access, for callers that mutate the model between
+    /// evaluations -- an MCMC that proposes new stationary frequencies, say.
+    /// The eigen decomposition is refactored by InitWithQPi(), so a caller
+    /// changing Q or the frequencies must call that rather than assigning to
+    /// the members.
+    SubstMatrix<Precision>& model() noexcept { return model_; }
 
 private:
     BinaryTree<Precision> topology_;
@@ -216,8 +268,8 @@ private:
     void compute_node(int index) {
         auto& node = topology_.Nodes[static_cast<std::size_t>(index)];
         if (node.IsTip()) return;
-        compute_node(node.cleft_idx);
-        compute_node(node.cright_idx);
+        for (int slot = 0; slot < node.n_child; ++slot)
+            compute_node(node.child_idx[static_cast<std::size_t>(slot)]);
 
         // resize, not assign: the kernel below writes every element of the
         // first child's contribution, so pre-filling is wasted work.  After
@@ -226,9 +278,12 @@ private:
         if (node.likelihood.size() != block) node.likelihood.resize(block);
         auto* parent = node.likelihood.data();
 
-        const int children[2] = {node.cleft_idx, node.cright_idx};
-        for (int slot = 0; slot < 2; ++slot) {
-            const auto& child = topology_.Nodes[static_cast<std::size_t>(children[slot])];
+        // The first child seeds the parent and the rest multiply in.  A
+        // trifurcating root -- an unrooted tree rooted at an internal node --
+        // falls out of the same loop.
+        for (int slot = 0; slot < node.n_child; ++slot) {
+            const auto& child = topology_.Nodes[
+                static_cast<std::size_t>(node.child_idx[static_cast<std::size_t>(slot)])];
             model_.PMatrix(child.branch_length, pmat_, pmat_scratch_);
             multiply_partial(parent, child.likelihood.data(),
                              pmat_.data().data(), slot == 0);
